@@ -444,6 +444,39 @@ cursor=pg.next_cursor;
 let oldest=0;for(const t of all){const ts=+t.timestamp||0;if(ts&&(!oldest||ts<oldest))oldest=ts;}
 if(oldest&&nowS-oldest>MAX_AGE_S)break;}
 return all;}
+/* ===== 即時 ΔOI：鏈上 PositionSplit／PositionsMerge（v7 已驗證）=====
+   開市場嗰陣直接問 Polygon 公開 RPC，攞過去 30 分鐘窗口內呢個市場（topics[3]=conditionId）
+   嘅 split／merge，ΔOI 股數 = split − merge。一開即有數，唔使等 30 分鐘基線，亦唔使
+   localStorage。v7 終身對照證實：鏈上 logs 係即時真相，比 holders API 更快（殘差只係
+   API 索引滯後）。RPC 全部唔通就回 null，由快照版頂上。 */
+const OI_CTF="0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const OI_TOPIC_SPLIT="0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298";
+const OI_TOPIC_MERGE="0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca";
+const OI_RPCS=["https://polygon-bor.publicnode.com","https://polygon.llamarpc.com","https://rpc.ankr.com/polygon","https://1rpc.io/matic","https://polygon.drpc.org","https://polygon-rpc.com"];
+async function oiRpcOne(url,method,params,timeoutMs){
+const c=new AbortController();const t=setTimeout(()=>c.abort(),timeoutMs||4000);
+try{const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params}),signal:c.signal});clearTimeout(t);if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(j.error)throw new Error("RPC err");return j.result;}catch(e){clearTimeout(t);throw e;}}
+async function oiRpc(method,params){
+let lastErr=null;
+for(const u of OI_RPCS){try{return await oiRpcOne(u,method,params,4000);}catch(e){lastErr=e;}}
+throw lastErr||new Error("all RPCs failed");}
+async function oiGetLogs(topic,cond,fromB,toB){
+const base={address:OI_CTF,fromBlock:"0x"+fromB.toString(16),toBlock:"0x"+toB.toString(16)};
+try{return await oiRpc("eth_getLogs",[{...base,topics:[topic,null,null,cond]}]);}
+catch(e){return await oiRpc("eth_getLogs",[{...base,topics:[topic]}]);}}
+async function fetchChainDeltaOi(cond,winS){
+const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error("chain OI timeout")),10000));
+const work=(async()=>{
+const latest=parseInt(await oiRpc("eth_blockNumber",[]),16);
+const blk=await oiRpc("eth_getBlockByNumber",["latest",false]);
+const nowTs=parseInt(blk.timestamp,16);
+const fromB=Math.round(latest-winS/2.05);
+const condL=cond.toLowerCase();
+const sum=logs=>{let s=0;for(const l of logs){if((l.topics[3]||"").toLowerCase()===condL){try{s+=Number(BigInt("0x"+l.data.slice(130,194)))/1e6;}catch(e){}}}return s;};
+const [a,b]=await Promise.all([oiGetLogs(OI_TOPIC_SPLIT,condL,fromB,latest),oiGetLogs(OI_TOPIC_MERGE,condL,fromB,latest)]);
+return {dOiSh:sum(a)-sum(b),fromB,toB:latest};
+})();
+try{return await Promise.race([work,timeout]);}catch(e){return null;}}
 function renderAlerts(alerts,oc0,oc1,holdMap){
 if(!alerts.length)return '<div class="note">暫時未偵測到大額買入／大額賣出／對家大額買入（門檻 '+fmtShares(ALERT_MIN_SHARES)+' shares；掃描最近最多 5,000 筆成交（約 6 小時內），舊警示會累積保留）。</div>';
 const rows=alerts.map(a=>{
@@ -463,10 +496,15 @@ const box=$("marketDetail");
 box.innerHTML='<div class="detail"><h3>'+esc(m.question)+'</h3><div class="bar"><button class="ghost" onclick="closeMarket()">✕ 關閉</button></div><div class="status">載入全市場數據中…</div></div>';
 box.scrollIntoView({behavior:"smooth",block:"start"});
 try{
-const [holders,trades,evData]=await Promise.all([
+const [holders,trades,evData,oiData,chainOi]=await Promise.all([
 api("https://data-api.polymarket.com/v2/holders?condition="+m.cond+"&limit=1000").catch(()=>[]),
 fetchTradesPages(m.cond).catch(()=>[]),
-(m.eventSlug?api("https://gamma-api.polymarket.com/events?slug="+encodeURIComponent(m.eventSlug)).catch(()=>null):Promise.resolve(null))]);
+(m.eventSlug?api("https://gamma-api.polymarket.com/events?slug="+encodeURIComponent(m.eventSlug)).catch(()=>null):Promise.resolve(null)),
+api("https://data-api.polymarket.com/v2/oi?condition="+m.cond).catch(()=>null),
+fetchChainDeltaOi(m.cond,1800).catch(()=>null)]);
+/* 官方 OI：/v2/oi 只返即時 priced gross OI，無歷史；ΔOI 優先用鏈上 logs 即時計（下面 Feature 2），呢個數只作參考。 */
+let oiVal=null;
+if(oiData){const r=(oiData.data&&oiData.data[0])||(Array.isArray(oiData)?oiData[0]:null);if(r&&r.value!=null)oiVal=+r.value;}
 /* 同場總投注：呢場比賽全部市場嘅 volume 總和（event 層級 volume 欄位已係總和；攞唔到就自己加埋啲市場 volume）。 */
 let evVol=null;
 if(evData){const ev=Array.isArray(evData)?evData[0]:evData;
@@ -513,6 +551,63 @@ for(const w of mmWallets){mmRem0+=posByWallet[w][0]||0;mmRem1+=posByWallet[w][1]
 const ret0=tot0-mmRem0,ret1=tot1-mmRem1;
 const prefDen=ret0+ret1,pref=prefDen>0?(ret1-ret0)/prefDen:null;
 const prefTxt=pref==null?"—":(pref>=0?"+":"")+(pref*100).toFixed(2)+"%";
+/* 偏好度解讀（莊家角度）：±20% 以內無單邊啟示；+20%～+50% 莊家輕度偏好主隊贏，+50% 以上極度偏好主隊贏；−20%～−50% 莊家輕度偏好客隊贏，−50% 以下極度偏好客隊贏。 */
+let prefLabel="";
+if(pref!=null){
+if(pref>0.5)prefLabel="莊家極度偏好主隊贏";
+else if(pref>0.2)prefLabel="莊家輕度偏好主隊贏";
+else if(pref>=-0.2)prefLabel="莊家無單邊啟示";
+else if(pref>=-0.5)prefLabel="莊家輕度偏好客隊贏";
+else prefLabel="莊家極度偏好客隊贏";}
+/* ===== Feature 2：真錢純度 = ΔOI／ΔVolume（30 分鐘窗口）=====
+   ΔVolume：窗口內成交 $ 總額（trades 已有）。
+   ΔOI：優先用鏈上 logs 即時計（v7 已驗證）：開市場嗰陣問 Polygon 公開 RPC，攞過去
+   30 分鐘窗口內呢個市場嘅 PositionSplit／PositionsMerge，ΔOI 股數 = split − merge。
+   一開即有數，唔使等 30 分鐘基線。RPC 全部唔通先跌返去 localStorage 快照版
+   （每次開市場存一個快照，搵最接近 30 分鐘前嗰個做基線；第一次開會顯示「基線收集中」）。
+   ΔOI $ = ΔOI 股數 × 窗口 Yes VWAP（無就用現價）。 */
+const PURITY_WIN_S=30*60,PURITY_MIN_VOL=100;
+const winTrades=trades.filter(t=>t&&t.timestamp&&(nowS-(+t.timestamp))<=PURITY_WIN_S);
+const dVol30=winTrades.reduce((a,t)=>a+(+t.size||0)*(+t.price||0),0);
+const yesWin=winTrades.filter(t=>+t.outcome_index===0);
+const yesVolSh=yesWin.reduce((a,t)=>a+(+t.size||0),0);
+const vwapYes=yesVolSh>0?yesWin.reduce((a,t)=>a+(+t.size||0)*(+t.price||0),0)/yesVolSh:null;
+const pxNow=(m.prices&&m.prices[0]!=null)?+m.prices[0]:null;
+const pxRef=vwapYes!=null?vwapYes:pxNow;
+const snapKey="pm_oi_snap_"+m.cond;
+let snaps=[];try{snaps=JSON.parse(localStorage.getItem(snapKey)||"[]");if(!Array.isArray(snaps))snaps=[];}catch(e){snaps=[];}
+const nowMs=Date.now();
+snaps=snaps.filter(s=>s&&s.t&&(nowMs-s.t)<2*3600*1000);
+let baseSnap=null,bestDt=1e15;
+for(const s of snaps){const ageMin=(nowMs-s.t)/60000,dt=Math.abs(ageMin-30);if(ageMin>=20&&ageMin<=40&&dt<bestDt){bestDt=dt;baseSnap=s;}}
+const curSnap={t:nowMs,tot0:tot0,tot1:tot1,oi:oiVal,px:pxNow};
+snaps.push(curSnap);snaps=snaps.slice(-12);
+try{localStorage.setItem(snapKey,JSON.stringify(snaps));}catch(e){}
+let dOiSh=null,dOiUsd=null,purity=null,purityNote="",oiSrc="";
+const setPurity=()=>{
+if(pxRef!=null)dOiUsd=dOiSh*pxRef;
+if(dVol30>=PURITY_MIN_VOL&&dOiUsd!=null)purity=dOiUsd/dVol30;
+else if(dVol30<PURITY_MIN_VOL)purityNote="窗口成交太少（30 分鐘內成交 "+fmtUSD(dVol30)+"），比值唔準。";
+else purityNote="未能計出（欠價格）。";};
+if(chainOi!=null){dOiSh=chainOi.dOiSh;oiSrc="鏈上即時";setPurity();}
+else if(!baseSnap){oiSrc="快照";purityNote="鏈上 RPC 暫時唔通，改用快照版：呢個市場 30 分鐘前未有快照，宜家已記錄基線，下次再開（30 分鐘後）就有數。";}
+else{dOiSh=tot0-(baseSnap.tot0||0);oiSrc="快照（鏈上 RPC 暫時唔通）";setPurity();}
+/* 價格方向：窗口頭 10 分鐘 Yes VWAP vs 尾 10 分鐘 Yes VWAP */
+let pxChgTxt="";
+if(yesWin.length>=4){
+const early=yesWin.filter(t=>(nowS-(+t.timestamp))>20*60),late=yesWin.filter(t=>(nowS-(+t.timestamp))<=10*60);
+const vw=arr=>{const s=arr.reduce((a,t)=>a+(+t.size||0),0);return s>0?arr.reduce((a,t)=>a+(+t.size||0)*(+t.price||0),0)/s:null;};
+const pe=vw(early),pl=vw(late);
+if(pe!=null&&pl!=null){const chg=(pl-pe)*100;pxChgTxt="Yes 價：窗口初 "+pe.toFixed(2)+" → 窗口尾 "+pl.toFixed(2)+"（"+(chg>=0?"+":"")+chg.toFixed(2)+" 點）";}
+}
+let purityTxt="—",purityLabel="";
+if(purity!=null){
+purityTxt=(purity>=0?"+":"")+purity.toFixed(2);
+if(purity>=0.7)purityLabel="真錢入場（Steam Move）：新資金鎖倉為主";
+else if(purity>=0.3)purityLabel="混合：有新錢亦有換手";
+else if(purity>=0)purityLabel="換手為主：價格波動未必持續";
+else purityLabel="平倉為主：舊倉了結，價格波動未必持續";
+}
 const sumAmt=arr=>arr.reduce((a,h)=>a+(+h.amount||0),0);
 const sumWin=arr=>WINDOWS.map((_,wi)=>arr.reduce((a,h)=>{const pw=perWallet[h.proxy_wallet+"|"+(+h.outcome_index)];return a+(pw?pw.deltas[wi]:0);},0));
 const sw0=sumWin(top0),sw1=sumWin(top1);
@@ -553,7 +648,9 @@ box.innerHTML='<div class="detail"><h3>'+esc(m.question)+'</h3>'
 +'<div class="grid2"><div class="card"><div class="k">全市場 '+esc(oc0)+' 總 shares（'+(all0.length>=1000?'頭 1000 名持倉者合計':'全部持倉者合計')+'）</div><div class="v num">'+fmtShares(tot0)+'</div><div style="font-size:12px;color:var(--mut)">假使 '+esc(oc0)+' 勝出，派彩總額 '+fmtUSD(tot0)+'（每股賠 $1）</div><div style="font-size:12px;color:var(--mut)">總潛在利潤 <span class="totprofittop" data-oi="0" style="font-size:16px;font-weight:700;color:#f85149">計算中…</span><span class="profittick" data-oi="0" style="font-size:16px;font-weight:700;color:#22c55e"></span></div></div>'
 +'<div class="card"><div class="k">全市場 '+esc(oc1)+' 總 shares（'+(all1.length>=1000?'頭 1000 名持倉者合計':'全部持倉者合計')+'）</div><div class="v num">'+fmtShares(tot1)+'</div><div style="font-size:12px;color:var(--mut)">假使 '+esc(oc1)+' 勝出，派彩總額 '+fmtUSD(tot1)+'（每股賠 $1）</div><div style="font-size:12px;color:var(--mut)">總潛在利潤 <span class="totprofittop" data-oi="1" style="font-size:16px;font-weight:700;color:#f85149">計算中…</span><span class="profittick" data-oi="1" style="font-size:16px;font-weight:700;color:#22c55e"></span></div></div></div>'
 +'<div style="margin-top:10px;font-size:14px;font-weight:700;color:#22c55e">（主隊 '+esc(oc0)+' 總潛在利潤 − 客隊 '+esc(oc1)+' 總潛在利潤）／市場 Volume：<span class="profitdiff">計算中…</span></div>'
-+'<div style="margin-top:10px;font-size:14px;font-weight:700;color:#60a5fa">散戶單邊偏好度（已濾做市商）：'+prefTxt+' <span style="font-size:12px;font-weight:400;color:var(--mut)">（散戶主隊 '+fmtShares(ret0)+' 股／客隊 '+fmtShares(ret1)+' 股；已濾 '+mmWallets.size+' 個做市商錢包：雙邊持倉 '+mmBothN+' 個、高頻雙向 '+mmTwN+' 個，剔走主隊 '+fmtShares(mmRem0)+' 股／客隊 '+fmtShares(mmRem1)+' 股）</span></div>'
++'<div style="margin-top:10px;font-size:14px;font-weight:700;color:#60a5fa">散戶單邊偏好度（已濾做市商）：'+prefTxt+(prefLabel?'（'+prefLabel+'）':'')+' <span style="font-size:12px;font-weight:400;color:var(--mut)">（散戶主隊 '+fmtShares(ret0)+' 股／客隊 '+fmtShares(ret1)+' 股；已濾 '+mmWallets.size+' 個做市商錢包：雙邊持倉 '+mmBothN+' 個、高頻雙向 '+mmTwN+' 個，剔走主隊 '+fmtShares(mmRem0)+' 股／客隊 '+fmtShares(mmRem1)+' 股）</span></div>'
++'<div style="margin-top:10px;font-size:14px;font-weight:700">真錢純度 ΔOI／ΔVolume（30 分鐘）：'+purityTxt+(purityLabel?' <span style="font-size:12px;font-weight:400;color:var(--mut)">'+purityLabel+'</span>':'')+'</div>'
++'<div style="font-size:12px;color:var(--mut)">ΔOI '+(dOiSh==null?"—":(dOiSh>=0?"+":"")+fmtShares(dOiSh)+" 股（≈ "+(dOiUsd==null?"—":fmtUSD(dOiUsd))+"）")+' · ΔVolume（30 分鐘）'+fmtUSD(dVol30)+' · 官方 OI（priced gross）'+(oiVal==null?"—":fmtUSD(oiVal))+(oiSrc?' · ΔOI 來源：'+oiSrc:'')+(baseSnap&&chainOi==null?' · 基線 '+new Date(baseSnap.t).toLocaleString("zh-HK",{hour12:false}):"")+(purityNote?' · '+purityNote:"")+(pxChgTxt?' · '+pxChgTxt:"")+'</div>'
 +'<h3 style="margin:14px 0 8px">🚨 大額交易警示 <span class="status">門檻 '+fmtShares(ALERT_MIN_SHARES)+' shares · 累積 '+allAlerts.length+' 則</span> <button class="ghost" onclick="clearAlerts()">清除累積紀錄</button></h3>'
 +renderAlerts(allAlerts,oc0,oc1,holdMap)
 +'<div class="note">大額買入：單筆買入 ≥ 50,000 shares。大額賣出：單筆賣出 ≥ 50,000 shares。對家大額買入：單筆買入 ≥ 50,000 shares，而該交易者目前持有對家倉位（按最新持倉榜判斷）；符合對家條件嘅買入只會出「對家大額買入」一則，唔會重複。掃描最近最多 5,000 筆成交（約 6 小時內）；警示存喺呢部機嘅瀏覽器累積保留，撳「清除累積紀錄」可刪除。注意：官方 trades API 返唔齊舊成交，個別大額交易可能漏報；超過 6 小時前嘅大額交易亦唔會被掃到。</div>'
@@ -564,7 +661,7 @@ box.innerHTML='<div class="detail"><h3>'+esc(m.question)+'</h3>'
 +'<div style="overflow-x:auto"><table class="win-table">'+hhead+top0.map(hrow).join("")+rr0+tr0+'</table></div>'
 +'<h3 style="margin:14px 0 8px">'+esc(oc1)+' 首 20 名持倉者</h3>'
 +'<div style="overflow-x:auto"><table class="win-table">'+hhead+top1.map(hrow).join("")+rr1+tr1+'</table></div>'
-+'<div class="note">持倉者排名來自官方 holders API；時段變化來自近期成交紀錄（最多 5,000 筆，約 6 小時內）。各時段總數 = 首 20 名合計 + 「其餘所有交易者」一行，兩者相加一定等於上面嘅總數。撳「更新市場數據」可重新讀取最新數據。撳交易者名可睇佢喺呢個市場嘅過往交易紀錄。「均價」係該交易者錢包喺呢個市場呢個結果嘅持倉均價（官方 positions API），查唔到會顯示「—」。「派彩總額」= 總 shares × $1（每股勝出賠 $1），即係假使呢個結果勝出要付出畀所有持倉者嘅總金額；上方兩張卡亦會顯示各邊嘅總潛在利潤（該邊全部持倉者假使勝出嘅毛利總和）。兩張卡下面嘅綠色「（主隊總潛在利潤 − 客隊總潛在利潤）／市場 Volume」=（主隊總潛在利潤 − 客隊總潛在利潤）÷ 呢個市場嘅 trading volume，主隊係第一個結果（左卡），客隊係第二個結果（右卡）；正數代表主隊嗰邊總潛在利潤較大。比值係正數時，客隊（右卡）總潛在利潤數值旁邊會顯示綠色粗體 ✓；比值係負數時，✓ 就喺主隊（左卡）嗰邊；比值係零就兩邊都無 ✓。「潛在利潤」= 目前 Shares × (1 − 均價)，即係該交易者假使勝出嘅毛利。「其餘所有交易者」行嘅均價係其餘持倉者嘅加權平均，「總計」行嘅均價／潛在利潤係所有持倉者嘅加權平均／總和，喺背景逐個交易者查詢後填入；「其餘」行會列明共幾多名交易者、中位持倉（即係「其餘所有交易者」呢組按金額排序後，中間嗰個交易者嘅 shares），以及有幾多名未能取得均價同佢哋嘅總 shares；如有 * 號，即係部分交易者均價未能取得，按已取得股份計算。「同場總投注」= 呢場比賽全部市場嘅 trading volume 總和（包括讓分／大小盤等附屬市場）；如果成場得一個市場，唔會另外顯示。Volume 之前四句藍色提醒：「請教Gemini適合的注碼」括號內嘅參考金額 = 呢個市場 trading volume × 0.5%；籃球只參與NBA第4節、NCAAB下半場尾部，唔參與OT，且比數窄及利潤闊，+100或以下先入手；絕對值 absolute value 重要過比例 value 上嘅變化 trend。「散戶單邊偏好度」=（散戶客隊股數 − 散戶主隊股數）÷（散戶客隊股數 ＋ 散戶主隊股數），散戶 = 剔走做市商後嘅持倉者；做市商定義：同時持有雙邊（每邊 ≥100 股且細邊 ≥ 大邊 10%），或喺已讀成交窗口內高頻雙向買賣（兩邊都有成交或同一邊又買又賣，合共 ≥5 筆）。注意 Yes 總 shares 恆等於 No 總 shares（成對鑄造），未過濾前偏好度恆為 0；過濾後嘅數反映被濾走錢包嘅淨不平衡，只係啟發式估算，唔係官方分類。'+covNote+'</div></div>';
++'<div class="note">持倉者排名來自官方 holders API；時段變化來自近期成交紀錄（最多 5,000 筆，約 6 小時內）。各時段總數 = 首 20 名合計 + 「其餘所有交易者」一行，兩者相加一定等於上面嘅總數。撳「更新市場數據」可重新讀取最新數據。撳交易者名可睇佢喺呢個市場嘅過往交易紀錄。「均價」係該交易者錢包喺呢個市場呢個結果嘅持倉均價（官方 positions API），查唔到會顯示「—」。「派彩總額」= 總 shares × $1（每股勝出賠 $1），即係假使呢個結果勝出要付出畀所有持倉者嘅總金額；上方兩張卡亦會顯示各邊嘅總潛在利潤（該邊全部持倉者假使勝出嘅毛利總和）。兩張卡下面嘅綠色「（主隊總潛在利潤 − 客隊總潛在利潤）／市場 Volume」=（主隊總潛在利潤 − 客隊總潛在利潤）÷ 呢個市場嘅 trading volume，主隊係第一個結果（左卡），客隊係第二個結果（右卡）；正數代表主隊嗰邊總潛在利潤較大。比值係正數時，客隊（右卡）總潛在利潤數值旁邊會顯示綠色粗體 ✓；比值係負數時，✓ 就喺主隊（左卡）嗰邊；比值係零就兩邊都無 ✓。「潛在利潤」= 目前 Shares × (1 − 均價)，即係該交易者假使勝出嘅毛利。「其餘所有交易者」行嘅均價係其餘持倉者嘅加權平均，「總計」行嘅均價／潛在利潤係所有持倉者嘅加權平均／總和，喺背景逐個交易者查詢後填入；「其餘」行會列明共幾多名交易者、中位持倉（即係「其餘所有交易者」呢組按金額排序後，中間嗰個交易者嘅 shares），以及有幾多名未能取得均價同佢哋嘅總 shares；如有 * 號，即係部分交易者均價未能取得，按已取得股份計算。「同場總投注」= 呢場比賽全部市場嘅 trading volume 總和（包括讓分／大小盤等附屬市場）；如果成場得一個市場，唔會另外顯示。Volume 之前四句藍色提醒：「請教Gemini適合的注碼」括號內嘅參考金額 = 呢個市場 trading volume × 0.5%；籃球只參與NBA第4節、NCAAB下半場尾部，唔參與OT，且比數窄及利潤闊，+100或以下先入手；絕對值 absolute value 重要過比例 value 上嘅變化 trend。「散戶單邊偏好度」=（散戶客隊股數 − 散戶主隊股數）÷（散戶客隊股數 ＋ 散戶主隊股數），散戶 = 剔走做市商後嘅持倉者；做市商定義：同時持有雙邊（每邊 ≥100 股且細邊 ≥ 大邊 10%），或喺已讀成交窗口內高頻雙向買賣（兩邊都有成交或同一邊又買又賣，合共 ≥5 筆）。注意 Yes 總 shares 恆等於 No 總 shares（成對鑄造），未過濾前偏好度恆為 0；過濾後嘅數反映被濾走錢包嘅淨不平衡，只係啟發式估算，唔係官方分類。解讀：±20% 以內為莊家無單邊啟示；+20%～+50% 莊家輕度偏好主隊贏，+50% 以上極度偏好主隊贏；−20%～−50% 莊家輕度偏好客隊贏，−50% 以下極度偏好客隊贏。「真錢純度」= ΔOI ÷ ΔVolume（30 分鐘窗口）：ΔVolume 係窗口內成交 $ 總額；ΔOI 優先用鏈上 PositionSplit／PositionsMerge 即時計（一開即有數，唔使等基線），公開 RPC 全部唔通先跌返去用呢部機存嘅快照做基線（每次開市場記錄一次，搵最接近 30 分鐘前嗰個），第一次開某市場未有基線會顯示「基線收集中」；ΔOI $ = ΔOI 股數 × 窗口 Yes VWAP。≥0.7 為真錢入場，0.3–0.7 混合，<0.3 或負數為換手／平倉為主；窗口成交少過 $100 唔出比值。'+covNote+'</div></div>';
 const wallets=[...new Set([...top0,...top1].map(h=>h.proxy_wallet).filter(Boolean))];
 loadAvgPrices(wallets).then(()=>{loadRestStats(m.cond,{0:all0,1:all1});}).catch(()=>{});
 }catch(e){box.innerHTML='<div class="detail"><div class="bar"><button class="ghost" onclick="closeMarket()">✕ 關閉</button></div><div class="err">載入市場詳情失敗：'+esc(e.message)+'</div></div>';}}
